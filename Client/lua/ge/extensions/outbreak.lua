@@ -9,6 +9,16 @@ local defaultgreenFadeDistance = 20
 
 --extensions.unload("outbreak") extensions.load("outbreak") extensions.reload("outbreak")
 local blockedActions = {"dropPlayerAtCamera", "dropPlayerAtCameraNoReset", "recover_vehicle", "recover_vehicle_alt", "recover_to_last_road", "reload_vehicle", "reload_all_vehicles", "loadHome", "saveHome", "reset_all_physics" ,"reset_physics"}
+local infectedBlockedActions = {
+	"dropPlayerAtCamera", "dropPlayerAtCameraNoReset",
+	"switchCameraNext", "switchCameraPrev",
+	"toggleFreeCamera", "freeCamera",
+	"editorToggle", "toggleEditor"
+}
+
+local cleanupOutbreakVisuals
+local setInfectedActionLock
+local forceBackToOwnVehicle
 
 local function getStat(name)
 	return gameplay_statistic.metricGet(name) and gameplay_statistic.metricGet(name).value or 0
@@ -156,6 +166,8 @@ local function resetInfected()
 	core_input_actionFilter.addAction(0, 'noResetsInfection', false)
 
 	be:queueAllObjectLua("if outbreak then outbreak.setGameIsStopped() end")
+	setInfectedActionLock(false)
+	cleanupOutbreakVisuals()
 	--core_input_actionFilter.addAction(0, 'vehicleTeleporting', false)
 	--core_input_actionFilter.addAction(0, 'vehicleMenues', false)
 	--core_input_actionFilter.addAction(0, 'freeCam', false)
@@ -181,6 +193,8 @@ local function recieveGameState(data)
 		be:queueAllObjectLua("if outbreak then outbreak.setGameIsRunning() end")
 	else
 		be:queueAllObjectLua("if outbreak then outbreak.setGameIsStopped() end")
+	setInfectedActionLock(false)
+	cleanupOutbreakVisuals()
 	end
 end
 
@@ -393,7 +407,7 @@ local function sendContact(vehID,localVehID)
 				gamestate.players[vehPlayerName].contacted = true
 				local serverVehID = MPVehicleGE.getServerVehicleID(vehID)
 				local remotePlayerID, vehicleID = string.match(serverVehID, "(%d+)-(%d+)")
-				if TriggerServerEvent then TriggerServerEvent("onContact", remotePlayerID) end
+				if TriggerServerEvent then TriggerServerEvent("outbreak_onContactRecieve", remotePlayerID) end
 			end
 		end
 	end
@@ -401,7 +415,7 @@ end
 
 local function recieveInfected(data)
 	local playerName = data
-	local playerServerName = MPConfig:getNickname()
+	local playerServerName = MPConfig.getNickname()
 	if playerName == playerServerName then
 		MPVehicleGE.hideNicknames(false)
 	end
@@ -416,6 +430,9 @@ local function onVehicleSwitched(oldID,ID)
 
 	if gamestate.players and gamestate.players[curentOwnerName] and gamestate.players[curentOwnerName].infected then
 		MPVehicleGE.hideNicknames(false)
+		if ID and MPVehicleGE.isOwn and not MPVehicleGE.isOwn(ID) and gamestate.gameRunning and not gamestate.gameEnding then
+			forceBackToOwnVehicle(gamestate.time or 0)
+		end
 	elseif gamestate.players and gamestate.players[curentOwnerName] and not gamestate.players[curentOwnerName].infected then
 		MPVehicleGE.hideNicknames(true)
 	end
@@ -571,6 +588,8 @@ local lastVehPos = vec3()
 local vehVel = vec3()
 local moveTimer = 0
 local isStopped = true
+local infectedActionLock = false
+local lastBlockedSwitchMsg = 0
 
 local function checkForMovement(currentVehID,currentVeh,dt)
 	vehPos:set(be:getObjectOOBBCenterXYZ(currentVehID))
@@ -596,6 +615,35 @@ local function checkForMovement(currentVehID,currentVeh,dt)
 	end
 end
 
+cleanupOutbreakVisuals = function()
+	if obvignetteShaderAPI then
+		obvignetteShaderAPI.resetVignette()
+	end
+	scenetree["PostEffectCombinePassObject"]:setField("enableBlueShift", 0,0)
+	scenetree["PostEffectCombinePassObject"]:setField("blueShiftColor", 0,"0 0 0")
+end
+
+setInfectedActionLock = function(state)
+	if infectedActionLock == state then return end
+	core_input_actionFilter.setGroup('outbreak_no_teleport_infected', infectedBlockedActions)
+	core_input_actionFilter.addAction(0, 'outbreak_no_teleport_infected', state)
+	infectedActionLock = state
+end
+
+forceBackToOwnVehicle = function(currentTime)
+	if not MPVehicleGE or not MPVehicleGE.getVehicles then return end
+	for _, vehicle in pairs(MPVehicleGE.getVehicles()) do
+		if MPVehicleGE.isOwn and MPVehicleGE.isOwn(vehicle.gameVehicleID) then
+			pcall(function() be:enterVehicle(0, vehicle.gameVehicleID) end)
+			if (currentTime - lastBlockedSwitchMsg) > 2 then
+				guihooks.message({txt = "Outbreak: infected players cannot freecam/teleport to other players."}, 3, "outbreak.infected.restrict")
+				lastBlockedSwitchMsg = currentTime
+			end
+			return
+		end
+	end
+end
+
 local focusedVehPos = vec3()
 local otherVehPos = vec3()
 
@@ -614,7 +662,20 @@ local function onPreRender(dt)
 	end
 
 	local focusedPlayer = gamestate.players[curentOwnerName]
-	if not focusedPlayer then return end
+	if not focusedPlayer then
+		setInfectedActionLock(false)
+		return
+	end
+
+	if focusedPlayer.infected and gamestate.gameRunning and not gamestate.gameEnding then
+		setInfectedActionLock(true)
+		if currentVehID and MPVehicleGE.isOwn and not MPVehicleGE.isOwn(currentVehID) then
+			forceBackToOwnVehicle(gamestate.time or 0)
+			return
+		end
+	else
+		setInfectedActionLock(false)
+	end
 
 	if gamestate.settings and gamestate.settings.disableResetsWhenMoving == true then
 		if MPVehicleGE.isOwn(currentVehID) then
@@ -653,7 +714,7 @@ local function onPreRender(dt)
 
 	local tempSetting = defaultgreenFadeDistance
 	if gamestate.settings then
-		tempSetting = gamestate.settings.greenFadeDistance
+		tempSetting = gamestate.settings.GreenFadeDistance
 	end
 	distancecolor = math.min(1,1 -(closestInfected/(tempSetting or defaultgreenFadeDistance)))
 
@@ -703,6 +764,17 @@ end
 
 local function onExtensionUnloaded()
 	resetInfected()
+	cleanupOutbreakVisuals()
+end
+
+local function onClientEndMission()
+	resetInfected()
+	cleanupOutbreakVisuals()
+end
+
+local function onClientPreStartMission()
+	cleanupOutbreakVisuals()
+	setInfectedActionLock(false)
 end
 
 if MPGameNetwork then AddEventHandler("outbreak_recieveInfected", recieveInfected) end
@@ -718,6 +790,8 @@ M.onPreRender = onPreRender
 M.onVehicleSwitched = onVehicleSwitched
 M.resetInfected = resetInfected
 M.onExtensionUnloaded = onExtensionUnloaded
+M.onClientEndMission = onClientEndMission
+M.onClientPreStartMission = onClientPreStartMission
 M.onVehicleSpawned = onVehicleSpawned
 M.onVehicleColorChanged = onVehicleColorChanged
 M.gamestate = gamestate

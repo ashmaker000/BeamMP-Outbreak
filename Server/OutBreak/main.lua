@@ -21,8 +21,38 @@ local defaultDistancecolor = 0.5 -- max intensity of the green filter
 local disableResetsWhenMoving = true
 local maxResetMovingSpeed = 2
 
+local CONTACT_EVENT_ID = "outbreak_onContactRecieve"
+local SECOND_EVENT_ID = "outbreak_second"
+local TIMER_ID = "outbreak_counter"
+
+-- Single source of truth for admin controls
+local outbreakOwners = {""} -- set exact in-game names, e.g. {"Owner1", "Owner2"}; keep {""} to disable owner-only admin management
+local outbreakAdmins = {}
+local adminOnlyMode = false
+
+local function isOwner(playerName)
+	if not playerName then return false end
+	for _, ownerName in ipairs(outbreakOwners) do
+		if ownerName ~= "" and playerName == ownerName then
+			return true
+		end
+	end
+	return false
+end
+
+local function isAdmin(playerName)
+	return isOwner(playerName) or outbreakAdmins[playerName] == true
+end
+
+local function canUseAdminCommands(playerName)
+	if adminOnlyMode then
+		return isAdmin(playerName)
+	end
+	return true
+end
+
 MP.RegisterEvent("outbreak_clientReady","clientReady")
-MP.RegisterEvent("outbreak_onContactRecieve","onContact")
+MP.RegisterEvent(CONTACT_EVENT_ID,"onContact")
 MP.RegisterEvent("outbreak_requestGameState","requestGameState")
 MP.TriggerClientEvent(-1, "outbreak_resetInfected", "data")
 
@@ -457,7 +487,7 @@ local autoStartWaitInSeconds = 600
 function timer()
 	if gameState.gameRunning then
 		gameRunningLoop()
-	elseif autoStart and MP.GetPlayerCount() > -1 then
+	elseif autoStart and MP.GetPlayerCount() > 0 then
 		autoStartTimer = autoStartTimer + 1
 		if autoStartTimer >= autoStartWaitInSeconds then
 			autoStartTimer = 0
@@ -466,12 +496,10 @@ function timer()
 	end
 end
 
-MP.RegisterEvent("onContact", "onContact")
-
-MP.RegisterEvent("second", "timer")
-MP.CancelEventTimer("counter")
-MP.CancelEventTimer("second")
-MP.CreateEventTimer("second",1000)
+MP.CancelEventTimer(TIMER_ID)
+MP.CancelEventTimer(SECOND_EVENT_ID)
+MP.RegisterEvent(SECOND_EVENT_ID, "timer")
+MP.CreateEventTimer(SECOND_EVENT_ID,1000)
 
 
 
@@ -611,6 +639,44 @@ local function setResetSpeed(sender_id, sender_name, message, value)
 	end
 end
 
+
+local function adminadd(sender_id, sender_name, message, value)
+	if not isOwner(sender_name) then
+		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
+		return
+	end
+	local targetName = string.match(message or "", "^/%S+%s+adminadd%s+(.+)$")
+	if targetName and targetName ~= "" then
+		outbreakAdmins[targetName] = true
+		MP.SendChatMessage(-1, "Outbreak admin added: "..targetName)
+	else
+		MP.SendChatMessage(sender_id, "Usage: /infection adminadd <player name>")
+	end
+end
+
+local function adminremove(sender_id, sender_name, message, value)
+	if not isOwner(sender_name) then
+		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
+		return
+	end
+	local targetName = string.match(message or "", "^/%S+%s+adminremove%s+(.+)$")
+	if targetName and targetName ~= "" then
+		outbreakAdmins[targetName] = nil
+		MP.SendChatMessage(-1, "Outbreak admin removed: "..targetName)
+	else
+		MP.SendChatMessage(sender_id, "Usage: /infection adminremove <player name>")
+	end
+end
+
+local function adminonly(sender_id, sender_name)
+	if not isOwner(sender_name) then
+		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
+		return
+	end
+	adminOnlyMode = not adminOnlyMode
+	MP.SendChatMessage(-1, "Outbreak admin-only mode is now "..(adminOnlyMode and "enabled" or "disabled"))
+end
+
 commands = {
 	["help"] = {
 		["function"] = help,
@@ -660,6 +726,23 @@ commands = {
 		["function"] = setResetSpeed,
 		["tooltip"] = "Sets the highest speed where resets are allowed",
 	},
+	["adminadd"] = {
+		["function"] = adminadd,
+		["tooltip"] = "Adds an outbreak admin (owner only)",
+		["usage"] = "player name",
+		["ownerOnly"] = true
+	},
+	["adminremove"] = {
+		["function"] = adminremove,
+		["tooltip"] = "Removes an outbreak admin (owner only)",
+		["usage"] = "player name",
+		["ownerOnly"] = true
+	},
+	["adminonly"] = {
+		["function"] = adminonly,
+		["tooltip"] = "Toggles admin-only mode for outbreak commands (owner only)",
+		["ownerOnly"] = true
+	},
 }
 
 --Chat Commands
@@ -669,9 +752,24 @@ function outbreakChatMessageHandler(sender_id, sender_name, message)
 		local commandstringraw = string.sub(message,string.len(msgStart)+2)
 		local commandstring, variable = string.match(commandstringraw,"^(.+) (%d*%.?%d*)$")
 		local commandStringFinal = commandstring or commandstringraw
+		if not commands[commandStringFinal] then
+			local commandWord = string.match(commandstringraw, "^(%S+)")
+			if commandWord and commands[commandWord] then
+				commandStringFinal = commandWord
+			end
+		end
 
 		if commands[commandStringFinal] then
-			commands[commandStringFinal]["function"](sender_id, sender_name, message ,tonumber(variable))
+			local cmd = commands[commandStringFinal]
+			if cmd.ownerOnly and not isOwner(sender_name) then
+				MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
+				return 1
+			end
+			if not cmd.ownerOnly and not canUseAdminCommands(sender_name) then
+				MP.SendChatMessage(sender_id, "Outbreak admin-only mode is enabled")
+				return 1
+			end
+			cmd["function"](sender_id, sender_name, message ,tonumber(variable))
 		else
 			MP.SendChatMessage(sender_id,"command not found, type /infection help for a list of infection commands")
 		end
