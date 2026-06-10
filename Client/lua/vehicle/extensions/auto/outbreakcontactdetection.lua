@@ -44,16 +44,16 @@ local function checkForCollisions()
 	end
 	if v.mpVehicleType == "R" then return end
 
---	local isColliding = false
+	--local isColliding = false
 	if next(mapmgr.objectCollisionIds) ~= nil then
 		vehiclePosition:set(obj:getCenterPosition())
 		for _,vehID in pairs(mapmgr.objectCollisionIds) do
-			--local distance = vehiclePosition:distance(obj:getObjectCenterPosition(vehID))
-			--if distance < ((obj:getObjectInitialLength(vehID)+carLength)/2)*1.1 then
+			local distance = vehiclePosition:distance(obj:getObjectCenterPosition(vehID))
+			if distance < ((obj:getObjectInitialLength(vehID)+carLength)/2)*1.1 then
 				obj:queueGameEngineLua("if outbreak then outbreak.sendContact("..vehID..","..vehicleID..") end")
---				isColliding = true
+				--isColliding = true
 				--collisionDebugDraw(vehID,isColliding)
-			--end
+			end
 		end
 	end
 	--collisionDebugDraw(vehicleID,isColliding)

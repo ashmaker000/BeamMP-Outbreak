@@ -5,6 +5,7 @@ local mod = math.fmod
 local gameState = {players = {}}
 local lastState = gameState
 local weightingArray = {}
+local transferContactCooldown = {}
 
 gameState.everyoneInfected = false
 gameState.gameRunning = false
@@ -14,45 +15,39 @@ local includedPlayers = {} --TODO make these do something
 local excludedPlayers = {} --TODO make these do something
 
 local roundLength = 5*60 -- length of the game in seconds
-local defaultGreenFadeDistance = 100 -- how close the infector has to be for the screen to start to turn green
+local defaultGreenFadeDistance = 20 -- how close the infector has to be for the screen to start to turn green
 local defaultColorPulse = false -- if the car color should pulse between the car color and green
 local defaultInfectorTint = true -- if the infector should have a green tint
 local defaultDistancecolor = 0.5 -- max intensity of the green filter
 local disableResetsWhenMoving = true
 local maxResetMovingSpeed = 2
+local defaultGameMode = "classic"
 
-local CONTACT_EVENT_ID = "outbreak_onContactRecieve"
-local SECOND_EVENT_ID = "outbreak_second"
-local TIMER_ID = "outbreak_counter"
-
--- Single source of truth for admin controls
-local outbreakOwners = {""} -- set exact in-game names, e.g. {"Owner1", "Owner2"}; keep {""} to disable owner-only admin management
-local outbreakAdmins = {}
-local adminOnlyMode = false
-
-local function isOwner(playerName)
-	if not playerName then return false end
-	for _, ownerName in ipairs(outbreakOwners) do
-		if ownerName ~= "" and playerName == ownerName then
-			return true
-		end
-	end
-	return false
-end
-
-local function isAdmin(playerName)
-	return isOwner(playerName) or outbreakAdmins[playerName] == true
-end
-
-local function canUseAdminCommands(playerName)
-	if adminOnlyMode then
-		return isAdmin(playerName)
-	end
-	return true
-end
+local gameModes = {
+	classic = {
+		name = "classic",
+		displayName = "Classic",
+		description = "infected players spread infection until no survivors remain"
+	},
+	tag = {
+		name = "tag",
+		displayName = "Tag",
+		description = "infection passes to the tagged player and the previous infected player is cured"
+	},
+	reverse = {
+		name = "reverse",
+		displayName = "Reverse",
+		description = "survivors chase infected players while infection spreads like Classic"
+	},
+	freeze = {
+		name = "freeze",
+		displayName = "Freeze",
+		description = "one infected player freezes survivors on contact instead of spreading infection"
+	}
+}
 
 MP.RegisterEvent("outbreak_clientReady","clientReady")
-MP.RegisterEvent(CONTACT_EVENT_ID,"onContact")
+MP.RegisterEvent("outbreak_onContactRecieve","onContact")
 MP.RegisterEvent("outbreak_requestGameState","requestGameState")
 MP.TriggerClientEvent(-1, "outbreak_resetInfected", "data")
 
@@ -125,15 +120,71 @@ function requestGameState(localPlayerID)
 	MP.TriggerClientEventJson(localPlayerID, "outbreak_recieveGameState", gameState)
 end
 
+local function recountPlayers()
+	local infectedCount = 0
+	local nonInfectedCount = 0
+	local frozenCount = 0
+	local playercount = 0
+
+	for _,player in pairs(gameState.players or {}) do
+		if type(player) == "table" then
+			if player.infected then
+				infectedCount = infectedCount + 1
+			else
+				nonInfectedCount = nonInfectedCount + 1
+				if player.frozen then
+					frozenCount = frozenCount + 1
+				end
+			end
+			playercount = playercount + 1
+		end
+	end
+
+	gameState.InfectedPlayers = infectedCount
+	gameState.nonInfectedPlayers = nonInfectedCount
+	gameState.frozenPlayers = frozenCount
+	gameState.playerCount = playercount
+	gameState.everyoneInfected = infectedCount >= playercount and nonInfectedCount == 0
+	gameState.everyoneFrozen = playercount > 0 and infectedCount > 0 and frozenCount >= nonInfectedCount
+end
+
+local function setPlayerInfected(playerName, infected)
+	local player = gameState.players[playerName]
+	if not player then return end
+
+	player.infected = infected
+	if infected then
+		player.frozen = false
+		MP.TriggerClientEvent(-1, "outbreak_recieveInfected", playerName)
+	end
+end
+
+local function contactPairKey(playerNameA, playerNameB)
+	if playerNameA < playerNameB then
+		return playerNameA.."|"..playerNameB
+	end
+	return playerNameB.."|"..playerNameA
+end
+
+local function transferContactOnCooldown(playerNameA, playerNameB)
+	local key = contactPairKey(playerNameA, playerNameB)
+	local now = gameState.time or 0
+	local lastContactTime = transferContactCooldown[key]
+	if lastContactTime and now - lastContactTime < 3 then
+		return true
+	end
+
+	transferContactCooldown[key] = now
+	return false
+end
+
 local function infectPlayer(playerName,force)
 	local player = gameState.players[playerName]
 	if player.localContact and player.remoteContact and not player.infected or force and not player.infected then
-		player.infected = true
+		setPlayerInfected(playerName, true)
 		if not force then
 			local infectorPlayerName = player.infecter
 			gameState.players[infectorPlayerName].stats.infected = gameState.players[infectorPlayerName].stats.infected + 1
-			gameState.InfectedPlayers = gameState.InfectedPlayers + 1
-			gameState.nonInfectedPlayers = gameState.nonInfectedPlayers - 1
 			gameState.oneInfected = true
 
 			MP.SendChatMessage(-1,""..infectorPlayerName.." has infected "..playerName.."!")
@@ -141,11 +192,71 @@ local function infectPlayer(playerName,force)
 			MP.SendChatMessage(-1,"server has infected "..playerName.."!")
 		end
 
-		MP.TriggerClientEvent(-1, "outbreak_recieveInfected", playerName)
-
+		recountPlayers()
 		updateClients()
 		--MP.TriggerClientEventJson(-1, "outbreak_recieveGameState", gameState)
 	end
+end
+
+local function transferInfection(infectedPlayerName, survivorPlayerName, messagePrefix)
+	local infectedPlayer = gameState.players[infectedPlayerName]
+	local survivorPlayer = gameState.players[survivorPlayerName]
+	if not infectedPlayer or not survivorPlayer or not infectedPlayer.infected or survivorPlayer.infected then return end
+	if transferContactOnCooldown(infectedPlayerName, survivorPlayerName) then return end
+
+	infectedPlayer.infected = false
+	infectedPlayer.localContact = false
+	infectedPlayer.remoteContact = false
+	infectedPlayer.infecter = nil
+
+	survivorPlayer.localContact = true
+	survivorPlayer.remoteContact = true
+	survivorPlayer.infecter = infectedPlayerName
+	setPlayerInfected(survivorPlayerName, true)
+	survivorPlayer.stats.infecter = infectedPlayerName
+	infectedPlayer.stats.infected = infectedPlayer.stats.infected + 1
+
+	recountPlayers()
+	if messagePrefix == "Reverse" then
+		MP.SendChatMessage(-1,""..survivorPlayerName.." took the infection from "..infectedPlayerName.."!")
+	else
+		MP.SendChatMessage(-1,""..infectedPlayerName.." tagged "..survivorPlayerName.." and became a survivor!")
+	end
+	updateClients()
+end
+
+local function spreadInfection(infectedPlayerName, survivorPlayerName, messagePrefix)
+	local infectedPlayer = gameState.players[infectedPlayerName]
+	local survivorPlayer = gameState.players[survivorPlayerName]
+	if not infectedPlayer or not survivorPlayer or not infectedPlayer.infected or survivorPlayer.infected then return end
+	if transferContactOnCooldown(infectedPlayerName, survivorPlayerName) then return end
+
+	survivorPlayer.localContact = true
+	survivorPlayer.remoteContact = true
+	survivorPlayer.infecter = infectedPlayerName
+	setPlayerInfected(survivorPlayerName, true)
+	survivorPlayer.stats.infecter = infectedPlayerName
+	infectedPlayer.stats.infected = infectedPlayer.stats.infected + 1
+	gameState.oneInfected = true
+
+	recountPlayers()
+	MP.SendChatMessage(-1,""..survivorPlayerName.." caught the infection from "..infectedPlayerName.."!")
+	updateClients()
+end
+
+local function freezePlayer(infectedPlayerName, survivorPlayerName)
+	local infectedPlayer = gameState.players[infectedPlayerName]
+	local survivorPlayer = gameState.players[survivorPlayerName]
+	if not infectedPlayer or not survivorPlayer or not infectedPlayer.infected or survivorPlayer.infected or survivorPlayer.frozen then return end
+
+	survivorPlayer.frozen = true
+	survivorPlayer.infecter = infectedPlayerName
+	survivorPlayer.stats.infecter = infectedPlayerName
+	infectedPlayer.stats.infected = infectedPlayer.stats.infected + 1
+
+	recountPlayers()
+	MP.SendChatMessage(-1,""..infectedPlayerName.." has frozen "..survivorPlayerName.."!")
+	updateClients()
 end
 
 function onContact(localPlayerID, data)
@@ -155,6 +266,26 @@ function onContact(localPlayerID, data)
 		local localPlayer = gameState.players[localPlayerName]
 		local remotePlayer = gameState.players[remotePlayerName]
 		if localPlayer and remotePlayer then
+			local mode = gameState.mode or defaultGameMode
+			if mode == "tag" then
+				if localPlayer.infected and not remotePlayer.infected then
+					transferInfection(localPlayerName, remotePlayerName, "Tag")
+				elseif remotePlayer.infected and not localPlayer.infected then
+					transferInfection(remotePlayerName, localPlayerName, "Tag")
+				end
+			elseif mode == "reverse" then
+				if localPlayer.infected and not remotePlayer.infected then
+					spreadInfection(localPlayerName, remotePlayerName, "Reverse")
+				elseif remotePlayer.infected and not localPlayer.infected then
+					spreadInfection(remotePlayerName, localPlayerName, "Reverse")
+				end
+			elseif mode == "freeze" then
+				if localPlayer.infected and not remotePlayer.infected then
+					freezePlayer(localPlayerName, remotePlayerName)
+				elseif remotePlayer.infected and not localPlayer.infected then
+					freezePlayer(remotePlayerName, localPlayerName)
+				end
+			else
 			if localPlayer.infected and not remotePlayer.infected then
 				gameState.players[remotePlayerName].remoteContact = true
 				gameState.players[remotePlayerName].infecter = localPlayerName
@@ -164,6 +295,7 @@ function onContact(localPlayerID, data)
 				gameState.players[localPlayerName].localContact = true
 				gameState.players[localPlayerName].infecter = remotePlayerName
 				infectPlayer(localPlayerName)
+			end
 			end
 			if gameState.nonInfectedPlayers == 0 then 
 				gameState.everyoneInfected = true
@@ -176,13 +308,16 @@ end
 local function gameSetup(time)
 	gameState = {}
 	gameState.players = {}
+	transferContactCooldown = {}
 	gameState.settings = {
 		GreenFadeDistance = defaultGreenFadeDistance,
+		greenFadeDistance = defaultGreenFadeDistance,
 		ColorPulse = defaultColorPulse,
 		infectorTint = defaultInfectorTint,
 		distancecolor = defaultDistancecolor,
 		disableResetsWhenMoving = disableResetsWhenMoving,
-		maxResetMovingSpeed = maxResetMovingSpeed
+		maxResetMovingSpeed = maxResetMovingSpeed,
+		mode = defaultGameMode
 		}
 	local playerCount = 0
 	for ID,Player in pairs(MP.GetPlayers()) do
@@ -202,6 +337,7 @@ local function gameSetup(time)
 			player.infected = false
 			player.localContact = false
 			player.remoteContact = false
+			player.frozen = false
 			gameState.players[Player] = player
 			playerCount = playerCount + 1
 			--MP.TriggerClientEvent(-1, "outbreak_addPlayers", tostring(k))
@@ -217,8 +353,10 @@ local function gameSetup(time)
 	gameState.playerCount = playerCount
 	gameState.InfectedPlayers = 0
 	gameState.nonInfectedPlayers = playerCount
+	gameState.frozenPlayers = 0
 	gameState.time = -5
 	gameState.roundLength = time or roundLength
+	gameState.mode = defaultGameMode
 	gameState.endtime = -1
 	gameState.oneInfected = false
 	gameState.everyoneInfected = false
@@ -245,6 +383,8 @@ local function gameEnd(reason)
 		MP.SendChatMessage(-1,"Game over, "..nonInfectedCount.." survived and "..infectedCount.." got infected")
 	elseif reason == "infected" then
 		MP.SendChatMessage(-1,"Game over, no survivors")
+	elseif reason == "frozen" then
+		MP.SendChatMessage(-1,"Game over, all survivors were frozen")
 	elseif reason == "manual" then
 		--MP.SendChatMessage(-1,"Game stopped,"..nonInfectedCount.." survived and "..infectedCount.." got infected")
 		MP.SendChatMessage(-1,"Game stopped, Everyone Looses")
@@ -279,7 +419,7 @@ local function infectRandomPlayer()
 			if not gameState.oneInfected then
 				gameState.players[playername].remoteContact = true
 				gameState.players[playername].localContact = true
-				gameState.players[playername].infected = true
+				setPlayerInfected(playername, true)
 				gameState.players[playername].firstInfected = true
 
 				if gameState.time == 5 then
@@ -287,10 +427,8 @@ local function infectRandomPlayer()
 				else
 					MP.SendChatMessage(-1,"no infected players, "..playername.." has been randomly infected!")
 				end
-				MP.TriggerClientEvent(-1, "outbreak_recieveInfected", playername)
 				gameState.oneInfected = true
-				gameState.InfectedPlayers = gameState.InfectedPlayers + 1
-				gameState.nonInfectedPlayers = gameState.nonInfectedPlayers - 1
+				recountPlayers()
 			end
 		else
 			weightingArray[playername].infections = weightingArray[playername].infections + 100
@@ -386,7 +524,8 @@ local function gameStarting()
 		end
 	end
 
-	MP.SendChatMessage(-1,"Infection game started, you have to survive for "..(days or "")..""..(hours or "")..""..(minutes or "")..""..(seconds or "").."")
+	local mode = gameModes[gameState.mode or defaultGameMode] or gameModes.classic
+	MP.SendChatMessage(-1,""..mode.displayName.." infection game started, you have to survive for "..(days or "")..""..(hours or "")..""..(minutes or "")..""..(seconds or "").."")
 end
 
 local function gameRunningLoop()
@@ -424,9 +563,8 @@ local function gameRunningLoop()
 		local playercount = 0
 		for playername,player in pairs(players) do
 			if player.localContact and player.remoteContact and not player.infected then
-				player.infected = true
+				setPlayerInfected(playername, true)
 				MP.SendChatMessage(-1,""..playername.." has been infected!")
-				MP.TriggerClientEvent(-1, "outbreak_recieveInfected", playername)
 			elseif player.stats and gameState.time > 5 and not player.infected then
 				if not player.stats.survivedTime then
 					player.stats.survivedTime = 5
@@ -444,9 +582,7 @@ local function gameRunningLoop()
 		if infectedCount >= gameState.playerCount and nonInfectedCount == 0 then
 			gameState.everyoneInfected = true
 		end
-		gameState.InfectedPlayers = infectedCount
-		gameState.nonInfectedPlayers = nonInfectedCount
-		gameState.playerCount = playercount
+		recountPlayers()
 
 		if gameState.time >= 5 and infectedCount == 0 then
 			infectRandomPlayer()
@@ -458,6 +594,9 @@ local function gameRunningLoop()
 		gameState.endtime = gameState.time + 10
 	elseif not gameState.gameEnding and gameState.everyoneInfected == true then
 		gameEnd("infected")
+		gameState.endtime = gameState.time + 10
+	elseif not gameState.gameEnding and gameState.mode == "freeze" and gameState.everyoneFrozen == true then
+		gameEnd("frozen")
 		gameState.endtime = gameState.time + 10
 	elseif gameState.gameEnding and gameState.time == gameState.endtime then
 		gameState.gameRunning = false
@@ -487,7 +626,7 @@ local autoStartWaitInSeconds = 600
 function timer()
 	if gameState.gameRunning then
 		gameRunningLoop()
-	elseif autoStart and MP.GetPlayerCount() > 0 then
+	elseif autoStart and MP.GetPlayerCount() > -1 then
 		autoStartTimer = autoStartTimer + 1
 		if autoStartTimer >= autoStartWaitInSeconds then
 			autoStartTimer = 0
@@ -496,10 +635,12 @@ function timer()
 	end
 end
 
-MP.CancelEventTimer(TIMER_ID)
-MP.CancelEventTimer(SECOND_EVENT_ID)
-MP.RegisterEvent(SECOND_EVENT_ID, "timer")
-MP.CreateEventTimer(SECOND_EVENT_ID,1000)
+MP.RegisterEvent("onContact", "onContact")
+
+MP.RegisterEvent("second", "timer")
+MP.CancelEventTimer("counter")
+MP.CancelEventTimer("second")
+MP.CreateEventTimer("second",1000)
 
 
 
@@ -564,11 +705,26 @@ local function reset(sender_id, sender_name, message, variable)
 	weightingArray = {}
 end
 
+local function setMode(sender_id, sender_name, message, mode)
+	if not gameModes[mode] then
+		MP.SendChatMessage(sender_id,"setting mode failed, unknown mode")
+		return
+	end
+	if gameState.gameRunning then
+		MP.SendChatMessage(sender_id,"setting mode failed, stop the current game first")
+		return
+	end
+
+	defaultGameMode = mode
+	MP.SendChatMessage(sender_id,"set infection mode to "..gameModes[mode].displayName.."")
+end
+
 local function greenFadeDist(sender_id, sender_name, message, value)
 	if value then
 		defaultGreenFadeDistance = value
 		if gameState.settings then
 			gameState.settings.GreenFadeDistance = defaultGreenFadeDistance
+			gameState.settings.greenFadeDistance = defaultGreenFadeDistance
 		end
 		MP.SendChatMessage(sender_id,"set greenFadeDist to "..value.."")
 
@@ -639,44 +795,6 @@ local function setResetSpeed(sender_id, sender_name, message, value)
 	end
 end
 
-
-local function adminadd(sender_id, sender_name, message, value)
-	if not isOwner(sender_name) then
-		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
-		return
-	end
-	local targetName = string.match(message or "", "^/%S+%s+adminadd%s+(.+)$")
-	if targetName and targetName ~= "" then
-		outbreakAdmins[targetName] = true
-		MP.SendChatMessage(-1, "Outbreak admin added: "..targetName)
-	else
-		MP.SendChatMessage(sender_id, "Usage: /infection adminadd <player name>")
-	end
-end
-
-local function adminremove(sender_id, sender_name, message, value)
-	if not isOwner(sender_name) then
-		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
-		return
-	end
-	local targetName = string.match(message or "", "^/%S+%s+adminremove%s+(.+)$")
-	if targetName and targetName ~= "" then
-		outbreakAdmins[targetName] = nil
-		MP.SendChatMessage(-1, "Outbreak admin removed: "..targetName)
-	else
-		MP.SendChatMessage(sender_id, "Usage: /infection adminremove <player name>")
-	end
-end
-
-local function adminonly(sender_id, sender_name)
-	if not isOwner(sender_name) then
-		MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
-		return
-	end
-	adminOnlyMode = not adminOnlyMode
-	MP.SendChatMessage(-1, "Outbreak admin-only mode is now "..(adminOnlyMode and "enabled" or "disabled"))
-end
-
 commands = {
 	["help"] = {
 		["function"] = help,
@@ -694,6 +812,22 @@ commands = {
 	["reset"] = {
 		["function"] = reset,
 		["tooltip"] = "resets randomizer weights",
+	},
+	["mode classic"] = {
+		["function"] = function(sender_id, sender_name, message) setMode(sender_id, sender_name, message, "classic") end,
+		["tooltip"] = "sets mode to Classic, the default infection mode",
+	},
+	["mode tag"] = {
+		["function"] = function(sender_id, sender_name, message) setMode(sender_id, sender_name, message, "tag") end,
+		["tooltip"] = "sets mode to Tag, where infection passes to the tagged player",
+	},
+	["mode reverse"] = {
+		["function"] = function(sender_id, sender_name, message) setMode(sender_id, sender_name, message, "reverse") end,
+		["tooltip"] = "sets mode to Reverse, where survivors chase the infected player",
+	},
+	["mode freeze"] = {
+		["function"] = function(sender_id, sender_name, message) setMode(sender_id, sender_name, message, "freeze") end,
+		["tooltip"] = "sets mode to Freeze, where one infected player freezes survivors",
 	},
 	["game length set"] = {
 		["function"] = gameLength,
@@ -726,23 +860,6 @@ commands = {
 		["function"] = setResetSpeed,
 		["tooltip"] = "Sets the highest speed where resets are allowed",
 	},
-	["adminadd"] = {
-		["function"] = adminadd,
-		["tooltip"] = "Adds an outbreak admin (owner only)",
-		["usage"] = "player name",
-		["ownerOnly"] = true
-	},
-	["adminremove"] = {
-		["function"] = adminremove,
-		["tooltip"] = "Removes an outbreak admin (owner only)",
-		["usage"] = "player name",
-		["ownerOnly"] = true
-	},
-	["adminonly"] = {
-		["function"] = adminonly,
-		["tooltip"] = "Toggles admin-only mode for outbreak commands (owner only)",
-		["ownerOnly"] = true
-	},
 }
 
 --Chat Commands
@@ -752,24 +869,9 @@ function outbreakChatMessageHandler(sender_id, sender_name, message)
 		local commandstringraw = string.sub(message,string.len(msgStart)+2)
 		local commandstring, variable = string.match(commandstringraw,"^(.+) (%d*%.?%d*)$")
 		local commandStringFinal = commandstring or commandstringraw
-		if not commands[commandStringFinal] then
-			local commandWord = string.match(commandstringraw, "^(%S+)")
-			if commandWord and commands[commandWord] then
-				commandStringFinal = commandWord
-			end
-		end
 
 		if commands[commandStringFinal] then
-			local cmd = commands[commandStringFinal]
-			if cmd.ownerOnly and not isOwner(sender_name) then
-				MP.SendChatMessage(sender_id, "Only the configured outbreak owner(s) can run this command")
-				return 1
-			end
-			if not cmd.ownerOnly and not canUseAdminCommands(sender_name) then
-				MP.SendChatMessage(sender_id, "Outbreak admin-only mode is enabled")
-				return 1
-			end
-			cmd["function"](sender_id, sender_name, message ,tonumber(variable))
+			commands[commandStringFinal]["function"](sender_id, sender_name, message ,tonumber(variable))
 		else
 			MP.SendChatMessage(sender_id,"command not found, type /infection help for a list of infection commands")
 		end
@@ -803,4 +905,3 @@ MP.RegisterEvent("onChatMessage", "outbreakChatMessageHandler")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onVehicleDeleted", "onVehicleDeleted")
 MP.RegisterEvent("onPlayerJoin", "requestGameState")
-

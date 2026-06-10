@@ -16,6 +16,10 @@ This is a recreation of the Infection game mode from Dirt 3 for BeamMP
 1. ```/infection start``` Starts infection game
 1. ```/infection stop``` Stops infection game
 1. ```/infection reset``` Resets randomizer weights so everyone has an equal chance of getting infected again
+1. ```/infection mode classic``` Sets the default Classic mode where infection spreads normally
+1. ```/infection mode tag``` Sets Tag mode where infection passes to the tagged player and the old infected player is cured
+1. ```/infection mode reverse``` Sets Reverse mode where survivors chase the infected player and infection spreads like Classic
+1. ```/infection mode freeze``` Sets Freeze mode where one infected player freezes survivors on contact
 1. ```/infection game length set``` Sets the length of the round in minutes
 1. ```/infection greenFadeDist set``` Adjusts how close in meters an infected car needs to be for the screen to start going green
 1. ```/infection filterIntensity set ``` Sets how intense the vignetting effect is
